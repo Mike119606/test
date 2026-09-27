@@ -1,0 +1,51 @@
+# ===== 大体积运行时与第三方源码（不纳入版本控制）=====
+/go/
+/python313/
+/gopath/
+/downloads/
+/.chatlog/
+
+# ===== 日志文件 =====
+*.log
+
+# ===== 压缩包 =====
+*.zip
+
+# ===== 密钥与敏感输出（切勿上传）=====
+key*.txt
+*key*.txt
+wx_key*
+wechat-decrypt*
+
+# ===== 编译产物与二进制 =====
+*.exe
+*.dll
+*.pyd
+
+# ===== 临时/提取输出 =====
+*_output.txt
+*_out.txt
+extract_out*.txt
+step7_test.txt
+sendkeys_test.txt
+clipboard_test.txt
+
+# ===== 截图 =====
+*.png
+
+# ===== 密钥与敏感数据（切勿上传）=====
+keeper-data/
+
+# ===== 微信/QQ 聊天记录导出（隐私）=====
+export/
+qq_export/
+
+# ===== OCR 输出产物 =====
+ocr_output/
+
+# ===== 安装包与 wheel 二进制包 =====
+*.msi
+*.whl
+
+# ===== 所有日志 txt =====
+*_log.txt

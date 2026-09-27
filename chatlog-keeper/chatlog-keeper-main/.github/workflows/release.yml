@@ -1,0 +1,392 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing annotated release tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chatlog-keeper-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-ref-gate:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_commit: ${{ steps.freeze.outputs.release_commit }}
+      release_tag: ${{ steps.freeze.outputs.release_tag }}
+      release_tag_object: ${{ steps.freeze.outputs.release_tag_object }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Freeze the annotated tag and exact release commit
+        id: freeze
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]
+          release_ref="refs/memexa-release-tags/$RELEASE_TAG"
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:${release_ref}"
+          test "$(git cat-file -t "$release_ref")" = "tag"
+          tag_object="$(git rev-parse --verify "${release_ref}^{tag}")"
+          tag_commit="$(git rev-parse --verify "${release_ref}^{commit}")"
+          tag_headers="$(git cat-file tag "$tag_object" | sed -n '/^$/q;p')"
+          direct_target="$(printf '%s\n' "$tag_headers" | sed -n 's/^object //p')"
+          direct_target_type="$(printf '%s\n' "$tag_headers" | sed -n 's/^type //p')"
+          embedded_tag="$(printf '%s\n' "$tag_headers" | sed -n 's/^tag //p')"
+          [[ "$direct_target" =~ ^[0-9a-f]{40}$ ]]
+          test "$direct_target_type" = "commit"
+          test "$direct_target" = "$tag_commit"
+          test "$embedded_tag" = "$RELEASE_TAG"
+          read -r remote_tag_object remote_tag_ref extra <<< "$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG")"
+          test -z "${extra:-}"
+          test "$remote_tag_object" = "$tag_object"
+          test "$remote_tag_ref" = "refs/tags/$RELEASE_TAG"
+          main_ref="refs/memexa-release-main"
+          git fetch --force --no-tags origin "refs/heads/main:${main_ref}"
+          test "$(git cat-file -t "$main_ref")" = "commit"
+          git merge-base --is-ancestor "$tag_commit" "$main_ref"
+          if test "$GITHUB_EVENT_NAME" = "push"; then
+            test "$GITHUB_REF_TYPE" = "tag"
+            test "$GITHUB_REF_NAME" = "$RELEASE_TAG"
+            test "$GITHUB_SHA" = "$tag_commit"
+          else
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            test "$GITHUB_REF_TYPE" = "branch"
+            test "$GITHUB_REF_NAME" = "main"
+            test "$GITHUB_REF" = "refs/heads/main"
+            test "$(git rev-parse --verify HEAD)" = "$GITHUB_SHA"
+            git merge-base --is-ancestor "$tag_commit" "$GITHUB_SHA"
+          fi
+          echo "release_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_tag_object=$tag_object" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    needs: release-ref-gate
+    runs-on: macos-15
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.release-ref-gate.outputs.release_commit }}
+      - name: Verify the frozen source commit
+        env:
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+        run: test "$(git rev-parse --verify HEAD)" = "$RELEASE_COMMIT"
+      - name: Set up exact release Python and SQLite
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        with:
+          miniconda-version: "py311_26.5.3-2"
+          activate-environment: chatlog-release-macos
+          environment-file: packaging/macos-release-environment.yml
+          auto-activate-base: false
+          channels: defaults
+          channel-priority: strict
+      - name: Verify exact release runtime
+        run: python -c "import os, platform, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 15); assert sqlite3.sqlite_version == '3.53.2'; assert sys.prefix == os.environ['CONDA_PREFIX']; assert os.environ.get('CONDA_DEFAULT_ENV') == 'chatlog-release-macos'; assert platform.machine() == 'arm64'"
+      - name: Install build and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r packaging/release-requirements-macos.txt
+          python -m pip install --disable-pip-version-check --no-deps --no-build-isolation .
+          python -m pip check
+      - name: Verify tag, module, and installed metadata versions
+        env:
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
+        run: python packaging/release_metadata.py verify-version --tag "$RELEASE_TAG"
+      - name: Test
+        run: python -m pytest -q
+      - name: Build Apple Silicon standalone executable
+        run: |
+          set -euo pipefail
+          python -m PyInstaller packaging/chatlog_keeper.spec --noconfirm --clean --distpath dist_exe
+          mv dist_exe/chatlog-keeper dist_exe/chatlog-keeper-macos-arm64
+          chmod 755 dist_exe/chatlog-keeper-macos-arm64
+      - name: Smoke-test architecture, protocols, and checksum
+        run: |
+          set -euo pipefail
+          dist_exe/chatlog-keeper-macos-arm64 --help
+          file dist_exe/chatlog-keeper-macos-arm64 | grep -q "Mach-O 64-bit executable arm64"
+          python packaging/release_metadata.py validate-capabilities \
+            --executable dist_exe/chatlog-keeper-macos-arm64
+          python packaging/release_metadata.py checksum \
+            --file dist_exe/chatlog-keeper-macos-arm64
+      - name: Build deterministic source bundle from frozen commit
+        env:
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          python packaging/release_metadata.py build-source-bundle \
+            --repository . \
+            --commit "${RELEASE_COMMIT}" \
+            --version "${version}" \
+            --output "dist_source/chatlog-keeper-v${version}-source.tar.gz"
+      - name: Upload macOS release inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chatlog-keeper-macos-arm64
+          path: |
+            dist_exe/chatlog-keeper-macos-arm64
+            dist_exe/chatlog-keeper-macos-arm64.sha256
+          if-no-files-found: error
+      - name: Upload frozen source bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chatlog-keeper-source-bundle
+          path: |
+            dist_source/chatlog-keeper-v*-source.tar.gz
+            dist_source/chatlog-keeper-v*-source.tar.gz.sha256
+          if-no-files-found: error
+
+  build-windows:
+    needs: [release-ref-gate, build-macos]
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.release-ref-gate.outputs.release_commit }}
+      - name: Verify the frozen source commit
+        shell: pwsh
+        env:
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+        run: |
+          if ((git rev-parse --verify HEAD).Trim() -ne $env:RELEASE_COMMIT) {
+            throw "release checkout commit mismatch"
+          }
+      - name: Set up exact release Python and SQLite
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        with:
+          miniconda-version: "py311_26.5.3-2"
+          activate-environment: chatlog-release-windows
+          environment-file: packaging/windows-release-environment.yml
+          auto-activate-base: false
+          channels: defaults
+          channel-priority: strict
+      - name: Verify exact runtime and shifted pending-byte gate
+        shell: pwsh
+        run: |
+          python -c "import os, platform, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 15); assert sqlite3.sqlite_version == '3.53.2'; assert sys.prefix == sys.base_prefix; assert os.path.samefile(os.path.dirname(sys.executable), os.environ['CONDA_PREFIX']); assert os.path.isdir(os.path.join(sys.prefix, 'Library', 'bin')); assert os.environ.get('CONDA_DEFAULT_ENV') == 'chatlog-release-windows'; assert platform.machine().lower() in {'amd64', 'x86_64'}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I chatlog_keeper/_qq_sqlite_helper.py --runtime-probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install build and test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r packaging/release-requirements-windows.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install --disable-pip-version-check --no-deps --no-build-isolation .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify tag, module, and installed metadata versions
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
+        run: python packaging/release_metadata.py verify-version --tag "$env:RELEASE_TAG"
+      - name: Test
+        run: python -m pytest -q
+      - name: Build standalone executable
+        run: python -m PyInstaller packaging/chatlog_keeper.spec --noconfirm --clean --distpath dist_exe
+      - name: Verify standalone executable outside the build environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $executable = (Resolve-Path -LiteralPath .\dist_exe\chatlog-keeper.exe).Path
+          $standaloneWorkdir = Join-Path $env:RUNNER_TEMP ("chatlog-keeper-smoke-" + [Guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $standaloneWorkdir | Out-Null
+          $originalPath = $env:PATH
+          Push-Location $standaloneWorkdir
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+            & $executable --help
+            if ($LASTEXITCODE -ne 0) { throw "standalone help probe failed" }
+            & $executable --_qq-sqlite-helper --runtime-probe
+            if ($LASTEXITCODE -ne 0) { throw "standalone SQLite probe failed" }
+            & $executable message-stream-v1 --capabilities
+            if ($LASTEXITCODE -ne 0) { throw "standalone message-stream capability failed" }
+            & $executable participant-directory-v1 --capabilities
+            if ($LASTEXITCODE -ne 0) { throw "standalone participant-directory capability failed" }
+            & $executable key-identity-v1 --capabilities
+            if ($LASTEXITCODE -ne 0) { throw "standalone key-identity capability failed" }
+            & $executable native-account-binding-v1 --capabilities
+            if ($LASTEXITCODE -ne 0) { throw "standalone native-account-binding capability failed" }
+            & $executable probe
+            if ($LASTEXITCODE -ne 0) { throw "standalone connector probe failed" }
+          } finally {
+            $env:PATH = $originalPath
+            Pop-Location
+          }
+      - name: Validate protocols and checksum executable
+        shell: pwsh
+        run: |
+          python packaging/release_metadata.py validate-capabilities `
+            --executable .\dist_exe\chatlog-keeper.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python packaging/release_metadata.py checksum `
+            --file .\dist_exe\chatlog-keeper.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Download macOS release inputs
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: chatlog-keeper-macos-arm64
+          path: dist_macos
+      - name: Download frozen source bundle
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: chatlog-keeper-source-bundle
+          path: dist_source
+      - name: Verify transferred release inputs
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
+        run: |
+          $releaseTag = [string]$env:RELEASE_TAG
+          $version = $releaseTag.Substring(1)
+          python packaging/release_metadata.py verify-checksum `
+            --file .\dist_macos\chatlog-keeper-macos-arm64 `
+            --checksum .\dist_macos\chatlog-keeper-macos-arm64.sha256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python packaging/release_metadata.py verify-checksum `
+            --file ".\dist_source\chatlog-keeper-v${version}-source.tar.gz" `
+            --checksum ".\dist_source\chatlog-keeper-v${version}-source.tar.gz.sha256"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build canonical approved artifact descriptors
+        shell: pwsh
+        env:
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
+        run: |
+          $releaseTag = [string]$env:RELEASE_TAG
+          $version = $releaseTag.Substring(1)
+          New-Item -ItemType Directory -Path .\dist_metadata -ErrorAction Stop | Out-Null
+          python packaging/release_metadata.py build-descriptor `
+            --commit "$env:RELEASE_COMMIT" `
+            --version $version `
+            --platform windows `
+            --arch x86_64 `
+            --executable .\dist_exe\chatlog-keeper.exe `
+            --source-bundle ".\dist_source\chatlog-keeper-v${version}-source.tar.gz" `
+            --output ".\dist_metadata\chatlog-keeper-v${version}-windows-x86_64.artifact.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python packaging/release_metadata.py build-descriptor `
+            --commit "$env:RELEASE_COMMIT" `
+            --version $version `
+            --platform macos `
+            --arch arm64 `
+            --executable .\dist_macos\chatlog-keeper-macos-arm64 `
+            --source-bundle ".\dist_source\chatlog-keeper-v${version}-source.tar.gz" `
+            --output ".\dist_metadata\chatlog-keeper-v${version}-macos-arm64.artifact.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload the complete release input set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chatlog-keeper-release-inputs
+          path: |
+            dist_exe/chatlog-keeper.exe
+            dist_exe/chatlog-keeper.exe.sha256
+            dist_macos/chatlog-keeper-macos-arm64
+            dist_macos/chatlog-keeper-macos-arm64.sha256
+            dist_source/chatlog-keeper-v*-source.tar.gz
+            dist_source/chatlog-keeper-v*-source.tar.gz.sha256
+            dist_metadata/chatlog-keeper-v*-windows-x86_64.artifact.json
+            dist_metadata/chatlog-keeper-v*-windows-x86_64.artifact.json.sha256
+            dist_metadata/chatlog-keeper-v*-macos-arm64.artifact.json
+            dist_metadata/chatlog-keeper-v*-macos-arm64.artifact.json.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    needs: [release-ref-gate, build-windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the tag-bound release inputs
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: chatlog-keeper-release-inputs
+          path: release_inputs
+      - name: Verify the exact release file set and every sidecar
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          test "$(find release_inputs -type f | wc -l | tr -d ' ')" = "10"
+          test -f release_inputs/dist_exe/chatlog-keeper.exe
+          test -f release_inputs/dist_macos/chatlog-keeper-macos-arm64
+          test -f "release_inputs/dist_source/chatlog-keeper-v${version}-source.tar.gz"
+          test -f "release_inputs/dist_metadata/chatlog-keeper-v${version}-windows-x86_64.artifact.json"
+          test -f "release_inputs/dist_metadata/chatlog-keeper-v${version}-macos-arm64.artifact.json"
+          (cd release_inputs/dist_exe && sha256sum -c chatlog-keeper.exe.sha256)
+          (cd release_inputs/dist_macos && sha256sum -c chatlog-keeper-macos-arm64.sha256)
+          (cd release_inputs/dist_source && sha256sum -c "chatlog-keeper-v${version}-source.tar.gz.sha256")
+          (cd release_inputs/dist_metadata && sha256sum -c "chatlog-keeper-v${version}-windows-x86_64.artifact.json.sha256")
+          (cd release_inputs/dist_metadata && sha256sum -c "chatlog-keeper-v${version}-macos-arm64.artifact.json.sha256")
+      - name: Publish the tag-bound GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.release-ref-gate.outputs.release_tag_object }}
+        run: |
+          set -euo pipefail
+          current_tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq .object.sha)"
+          test "$current_tag_object" = "$RELEASE_TAG_OBJECT"
+          current_tag_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq .object.type)"
+          test "$current_tag_type" = "tag"
+          current_tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_TAG_OBJECT" --jq .object.sha)"
+          current_target_type="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_TAG_OBJECT" --jq .object.type)"
+          current_tag_name="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_TAG_OBJECT" --jq .tag)"
+          test "$current_target_type" = "commit"
+          test "$current_tag_commit" = "$RELEASE_COMMIT"
+          test "$current_tag_name" = "$RELEASE_TAG"
+          version="${RELEASE_TAG#v}"
+          release_flags=()
+          if [[ "$version" == *-preview ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" \
+            release_inputs/dist_exe/chatlog-keeper.exe \
+            release_inputs/dist_exe/chatlog-keeper.exe.sha256 \
+            release_inputs/dist_macos/chatlog-keeper-macos-arm64 \
+            release_inputs/dist_macos/chatlog-keeper-macos-arm64.sha256 \
+            "release_inputs/dist_source/chatlog-keeper-v${version}-source.tar.gz" \
+            "release_inputs/dist_source/chatlog-keeper-v${version}-source.tar.gz.sha256" \
+            "release_inputs/dist_metadata/chatlog-keeper-v${version}-windows-x86_64.artifact.json" \
+            "release_inputs/dist_metadata/chatlog-keeper-v${version}-windows-x86_64.artifact.json.sha256" \
+            "release_inputs/dist_metadata/chatlog-keeper-v${version}-macos-arm64.artifact.json" \
+            "release_inputs/dist_metadata/chatlog-keeper-v${version}-macos-arm64.artifact.json.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "chatlog-keeper $RELEASE_TAG" \
+            --generate-notes \
+            "${release_flags[@]}"
